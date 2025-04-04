@@ -118,7 +118,7 @@ Product Suggestions:"""
             return Response({"suggestions": []}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)        
 
 
-class SendMessageView(APIView):
+class SendMessageView1(APIView):
     def retrieve_relevant_info(self, query, retriever, llm):
         prompt_template = """Use the following pieces of context to answer the user's question. If you don't know the answer, just say that you don't know, don't try to make up an answer.
 
@@ -388,3 +388,109 @@ class SendMessageView(APIView):
 #         response_data = {"response": chatbot_response, "suggested_products": suggested_products}
 #         print(f"Final Response Data: {response_data}")
 #         return Response(response_data, status=status.HTTP_200_OK)
+
+
+# --------using completion api model ---
+class SendMessageView(APIView):
+    def retrieve_relevant_info(self, query, retriever, llm):
+        prompt_template = """Use the following pieces of context to answer the user's question. If you don't know the answer, just say that you don't know, don't try to make up an answer.
+
+        Context:
+        {context}
+
+        Question: {question}"""
+        PROMPT = PromptTemplate(
+            template=prompt_template, input_variables=["context", "question"]
+        )
+
+        qa = RetrievalQA.from_chain_type(
+            llm=apps.get_app_config('chat').llm,
+            chain_type="stuff",
+            retriever=apps.get_app_config('chat').retriever,
+            return_source_documents=False,
+            chain_type_kwargs={"prompt": PROMPT}
+        )
+        result = qa({"query": query})
+        return result['result']
+
+    def post(self, request, *args, **kwargs):
+        user = request.user
+        user_message = request.data.get('message')
+        initial_suggestions = request.data.get('initial_suggestions', [])
+
+        print(f"User: {user.username}, Message Received: {user_message}")
+
+        if not user_message:
+            print("Error: Message is required")
+            return Response({"error": "Message is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        llm = apps.get_app_config('chat').llm
+        retriever = apps.get_app_config('chat').retriever
+
+        retrieved_info = self.retrieve_relevant_info(user_message, retriever, llm)
+
+        # Get entire conversation history
+        conversation_history = ChatHistory.objects.filter(user=user).order_by('timestamp').values_list('role', 'content')
+        formatted_history = "\n".join([f"{role.capitalize()}: {content}" for role, content in conversation_history])
+
+        available_products = Product.objects.values_list('name', flat=True)
+        products_formatted = "\n".join([f"- {product}" for product in available_products])
+
+        prompt_content = f"""You are a helpful AI assistant for suggesting products from the following list: {', '.join(available_products)}.
+
+You will be provided with relevant product information and the user's current message, along with the entire conversation history for context. Your goal is to respond to the user's query and suggest up to 3 relevant products.
+
+Format your response with "**Response:**" followed by your conversational answer, and then "**Suggested Products:**" followed by a bulleted list of product names. If no products are relevant, you can omit the "Suggested Products" section.
+
+Relevant Product Information:
+{retrieved_info}
+
+Conversation History:
+{formatted_history}
+
+Current Message:
+User: {user_message}
+
+**Response:** """
+
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4-turbo",
+                messages=[{"role": "user", "content": prompt_content}],
+                max_tokens=500,
+                n=1,
+                stop=None,
+                temperature=0.7,
+            )
+            chatbot_response = response.choices[0].message.content.strip()
+            print(f"Chatbot Response: {chatbot_response}")
+
+            suggested_products = []
+            if "**Suggested Products:**" in chatbot_response:
+                parts = chatbot_response.split("**Suggested Products:**")
+                chatbot_response = parts[0].replace("**Response:**", "").strip()
+                suggestions_text = parts[1].strip()
+                suggestion_lines = [line.strip().lstrip('- ').strip() for line in suggestions_text.split('\n') if line.strip().startswith('-')]
+                available_product_names = list(Product.objects.values_list('name', flat=True))
+                suggested_products = [{"name": name, "category": Product.objects.filter(name=name).first().category if Product.objects.filter(name=name).first() else None} for name in suggestion_lines if name in available_product_names and name not in initial_suggestions][:3]
+
+            print(f"Suggested Products: {suggested_products}")
+
+            ChatHistory.objects.create(
+                user=user,
+                role="user",
+                content=user_message,
+            )
+            ChatHistory.objects.create(
+                user=user,
+                role="assistant",
+                content=chatbot_response,
+            )
+
+            response_data = {"response": chatbot_response, "suggested_products": suggested_products}
+            return Response(response_data, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            print(f"Error getting response from OpenAI: {e}")
+            return Response({"error": "Failed to get response from OpenAI"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
