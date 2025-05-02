@@ -1,0 +1,48 @@
+# Byte-code files
+*.pyc
+__pycache__/
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Database
+db.sqlite3
+
+# Sensitive Environment Variables
+.env
+*.env
+credentials/
+# Collected static files (uncomment if you don't version them)
+# staticfiles/ # Or whatever your STATIC_ROOT is
+
+# User uploaded media files (uncomment if you don't version them)
+# media/ # Or whatever your MEDIA_ROOT is
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Python build/distribution files
+dist/
+*.egg-info/
+.Python
+
+# Installer logs
+pip-log.txt
+pip-delete-this-ragu.txt
+
+# Unit test / coverage reports
+htmlcov/
+.coverage
+.tox/
+
+# Documentation build files
+docs/_build/

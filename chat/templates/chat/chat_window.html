@@ -43,6 +43,8 @@
             display: flex;
             gap: 10px;
             margin-top: 10px;
+            flex-wrap: wrap;
+            align-items: center;
         }
         #user-input {
             flex-grow: 1;
@@ -50,6 +52,7 @@
             box-sizing: border-box;
             border: 1px solid #ccc;
             border-radius: 5px;
+            min-width: 150px;
         }
         #send-button {
             padding: 10px 20px;
@@ -62,6 +65,31 @@
         #send-button:hover {
             background-color: #0056b3;
         }
+        /* --- New Styles for Voice Elements --- */
+        #voiceToggleBtn {
+            padding: 10px 20px;
+            background-color: #28a745; /* Green color */
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        #voiceToggleBtn:hover {
+            background-color: #218838; /* Darker green */
+        }
+         #voiceToggleBtn:disabled {
+            background-color: #999;
+            cursor: not-allowed;
+        }
+        #voiceStatus {
+            margin-top: 0;
+            font-style: italic;
+            color: #555;
+            flex-basis: 100%;
+            text-align: center;
+            font-size: 0.9em;
+        }
+        /* ----------------------------------- */
         .message-container {
             display: flex;
             flex-direction: column;
@@ -118,6 +146,7 @@
             border-radius: 5px;
             background-color: #fff;
             box-shadow: 1px 1px 3px rgba(0, 0, 0, 0.05);
+            flex-shrink: 0;
         }
     </style>
 </head>
@@ -141,115 +170,811 @@
     <div id="user-input-area">
         <input type="text" id="user-input" placeholder="Type your message here...">
         <button id="send-button">Send</button>
+
+        {# --- Add Voice Control Button --- #}
+        <button id="voiceToggleBtn">Start Voice Chat</button>
+
+        {# --- Add Status Indicator Area --- #}
+        <div id="voiceStatus">Idle</div>
+
     </div>
 
+    {# Optional: An audio element can be used for simpler playback #}
+    <audio id="botAudioPlayback" style="display: none;"></audio>
+
     <script>
-        document.addEventListener('DOMContentLoaded', () => {
-            const token = localStorage.getItem('access_token');
-            if (!token) {
-                alert('Please log in to access the chat.');
-                window.location.href = '/api/users/';
-                return;
-            }
+                // --- Existing JavaScript from your file ---
+                document.addEventListener('DOMContentLoaded', () => {
+                    // === FIX: Declare element references at the top ===
+                    const chatContainer = document.getElementById('chat-container');
+                    const userInput = document.getElementById('user-input');
+                    const sendButton = document.getElementById('send-button');
+                    const suggestionsList = document.getElementById('suggestions-list');
+                    const dynamicSuggestionsList = document.getElementById('dynamic-suggestions-list');
+        
+                    // --- New Voice Elements References ---
+                    const voiceToggleBtn = document.getElementById('voiceToggleBtn');
+                    const voiceStatus = document.getElementById('voiceStatus');
+                    const botAudioPlayback = document.getElementById('botAudioPlayback');
+                    // ================================================
+        
+                    // Check for token on page load
+                    const token = localStorage.getItem('access_token');
+                    if (!token) {
+                        console.error('JWT token not found in localStorage.');
+                        alert('Please log in to access the chat.');
+                        window.location.href = '/api/users/'; // Redirect to login page URL (adjust if needed)
+                        // Disable chat features using the declared variables
+                        userInput.disabled = true;
+                        sendButton.disabled = true;
+                        voiceToggleBtn.disabled = true;
+                        updateVoiceStatus("Login Required");
+                        return; // Stop execution if not logged in
+                    } else {
+                        console.log("JWT token found in localStorage.");
+                        // Token exists, enable features initially using the declared variables
+                        userInput.disabled = false;
+                        sendButton.disabled = false;
+                        voiceToggleBtn.disabled = false;
+                        updateVoiceStatus("Ready"); // Initial status
+                    }
+        
+        
+                    let isRecording = false;
+                    let mediaStream = null; // Changed from mediaRecorder for clarity with Web Audio API
+                    let websocket = null;
+                    // Flag to indicate if recording should start immediately after the WebSocket connects
+                    let shouldStartRecordingAfterConnect = false;
+        
+        
+                    // Web Audio API components
+                    let audioContext = null;
+                    let audioSourceNode = null;
+                    // Correct declaration for scriptProcessorNode
+                    let scriptProcessorNode = null; // Or AudioWorkletNode for modern approach
 
-            const chatContainer = document.getElementById('chat-container');
-            const userInput = document.getElementById('user-input');
-            const sendButton = document.getElementById('send-button');
-            const suggestionsList = document.getElementById('suggestions-list');
-            const dynamicSuggestionsList = document.getElementById('dynamic-suggestions-list');
+                    let vadThreshold = 0.015; // Lower threshold for quieter environments, higher for noisy (0.0 to 1.0)
+                    let vadSilenceDurationThreshold = 1000; // How long (ms) to wait after last speech to trigger stop
+                    let vadSilenceTimer = null; // Timer ID for the silence timeout
+                    let vadLastSpeechTime = 0; // Timestamp of the last time speech (above threshold) was detected
+                    // =======================================
 
-            function displayMessage(message, sender) {
-                const messageContainer = document.createElement('div');
-                messageContainer.classList.add('message-container');
+                    // --- Helper function to update voice status UI ---
+                    function updateVoiceStatus(statusText) {
+                        voiceStatus.textContent = statusText;
+                    }
+        
+                    // --- Helper function to update voice button state and related inputs ---
+                    function setVoiceButtonState(text, disabled) {
+                        voiceToggleBtn.textContent = text;
+                        voiceToggleBtn.disabled = disabled;
+        
+                        // Also manage text input/send button state
+                        // They should be disabled when voice is active (connecting, processing, speaking, or listening)
+                        const voiceIsActive = (text === 'Connecting...' || text === 'Processing...' || text === 'Speaking...' || text === 'Stop Voice Chat' || text === 'Listening...');
+        
+                        if (voiceIsActive) {
+                            userInput.disabled = true;
+                            sendButton.disabled = true;
+                        } else { // Voice is idle, ready, or had an error - allow text input
+                            userInput.disabled = false;
+                            sendButton.disabled = false;
+                        }
+                    }
+        
+                    // --- Function to display messages (copied from your code) ---
+                    function displayMessage(message, sender) {
+                        const messageContainer = document.createElement('div');
+                        messageContainer.classList.add('message-container');
+        
+                        const messageDiv = document.createElement('div');
+                        messageDiv.classList.add(sender === 'user' ? 'user-message-bubble' : 'bot-message-bubble');
+                        messageDiv.textContent = message;
+        
+                        const timestampSpan = document.createElement('span');
+                        timestampSpan.classList.add('message-timestamp');
+                        const now = new Date();
+                        const timeString = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                        timestampSpan.textContent = timeString;
+        
+                        messageContainer.appendChild(messageDiv);
+                        messageContainer.appendChild(timestampSpan);
+                        chatContainer.appendChild(messageContainer);
+                        chatContainer.scrollTop = chatContainer.scrollHeight;
+                    }
+        
+                    // --- Function to load initial suggestions ---
+                    function loadInitialSuggestions() {
+                        const currentToken = localStorage.getItem('access_token'); // Get current token
+                        if (currentToken) { // Check if token exists before fetching
+                            fetch('/api/chat/suggestions/', { // Adjust URL if needed
+                                headers: {
+                                    'Authorization': `Bearer ${currentToken}` // Use the token here
+                                }
+                            })
+                            .then(response => {
+                                if (!response.ok) {
+                                    console.error('HTTP error loading suggestions:', response.status);
+                                    // Handle token expiration or invalidity here (e.g., redirect to login)
+                                    if (response.status === 401 || response.status === 403) {
+                                        alert("Session expired. Please log in again.");
+                                        window.location.href = '/api/users/'; // Redirect to login URL
+                                    }
+                                    return Promise.reject('HTTP error');
+                                }
+                                return response.json();
+                            })
+                            .then(data => {
+                                if (data && data.suggestions) {
+                                    suggestionsList.innerHTML = '';
+                                    data.suggestions.forEach(product => {
+                                        const listItem = document.createElement('li');
+                                        listItem.textContent = product.name;
+                                        suggestionsList.appendChild(listItem);
+                                    });
+                                }
+                            })
+                            .catch(error => console.error('Error loading suggestions:', error));
+                        } else {
+                            console.warn("No token found, skipping loading initial suggestions.");
+                        }
+                    }
+        
+                    loadInitialSuggestions();
+        
+                    // --- Function to send text message ---
+                    function sendTextMessage(message) {
+                        const currentToken = localStorage.getItem('access_token'); // Get current token
+                        if (message && currentToken) { // Check if token exists before sending
+                            displayMessage(message, 'user');
+                            userInput.value = '';
+                            // Disable inputs while text message is processing
+                            // Note: Voice button state is managed separately by setVoiceButtonState
+                            userInput.disabled = true;
+                            sendButton.disabled = true;
+        
+        
+                            fetch('/api/chat/send/', { // Adjust URL if needed
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': `Bearer ${currentToken}` // Use the token here
+                                },
+                                body: JSON.stringify({ message: message })
+                            })
+                            .then(response => {
+                                if (!response.ok) {
+                                    console.error('HTTP error sending message:', response.status);
+                                    // Handle token expiration or invalidity here
+                                    if (response.status === 401 || response.status === 403) {
+                                        alert("Session expired. Please log in again.");
+                                        window.location.href = '/api/users/'; // Redirect to login
+                                    }
+                                    return Promise.reject('HTTP error');
+                                }
+                                return response.json();
+                            })
+                            .then(data => {
+                                if (data && data.response) {
+                                    displayMessage(data.response, 'bot');
+                                } else if (data && data.error) {
+                                    displayMessage(`Error: ${data.error}`, 'bot');
+                                }
+        
+                                dynamicSuggestionsList.innerHTML = '';
+                                if (data && data.suggested_products) {
+                                    data.suggested_products.forEach(product => {
+                                        const productLi = document.createElement('li');
+                                        productLi.classList.add('dynamic-suggestion-item');
+                                        productLi.textContent = `${product.name} (${product.category})`;
+                                        dynamicSuggestionsList.appendChild(productLi);
+                                    });
+                                }
+                            })
+                            .catch(error => {
+                                console.error('Error sending message:', error);
+                                displayMessage('Error sending message. Please try again.', 'bot');
+                            })
+                            .finally(() => {
+                                // Re-enable text inputs after response
+                                userInput.disabled = false;
+                                sendButton.disabled = false;
+                            });
+                        } else if (!currentToken) {
+                            console.warn("No token found, cannot send text message.");
+                            alert("You are not logged in.");
+                            // Redirection is handled at DOMContentLoaded if token is missing initially
+                        }
+                    }
+        
+                    // --- Event listener for text send button ---
+                    sendButton.addEventListener('click', () => {
+                        const message = userInput.value.trim();
+                        sendTextMessage(message);
+                    });
+        
+                    // --- Optional: Allow sending message with Enter key ---
+                    userInput.addEventListener('keypress', (event) => {
+                        if (event.key === 'Enter') {
+                            event.preventDefault();
+                            sendButton.click();
+                        }
+                    });
+        
+                    // ===============================================================
+                    // --- New JavaScript for Voice Conversation (Includes JWT Logic) ---
+                    // ===============================================================
+        
+                    // --- Function to initialize WebSocket connection ---
+                    function connectWebSocket() {
+                        console.log("Entering connectWebSocket function."); // Console log
+        
+                        // Check if already connected or connecting
+                        if (websocket && (websocket.readyState === WebSocket.OPEN || websocket.readyState === WebSocket.CONNECTING)) {
+                            console.log('WebSocket already connected or connecting. State:', websocket.readyState);
+                            return;
+                        }
+        
+                        // Get the token from localStorage - REQUIRED for JWT authentication
+                        const token = localStorage.getItem('access_token');
+                        console.log("Token retrieved from localStorage:", token ? "Found" : "Not Found"); // Log token presence
+        
+                        if (!token) {
+                            console.error("No JWT token found in localStorage. Cannot connect WebSocket.");
+                            updateVoiceStatus("Login Required");
+                            setVoiceButtonState("Login Required", true); // Keep disabled
+                            alert("Please log in to use voice chat.");
+                            return; // Do not attempt to connect
+                        }
+        
+        
+                        // Construct the WebSocket URL, INCLUDING the JWT as a query parameter
+                        const wsScheme = window.location.protocol === "https:" ? "wss" : "ws";
+                        const wsUrl = `${wsScheme}://${window.location.host}/ws/chat/voice/?token=${token}`;
+                        console.log("Attempting to connect WebSocket to:", wsUrl);
+        
+                        // Attempt to create the WebSocket connection
+                        try {
+                            websocket = new WebSocket(wsUrl);
+                            console.log("WebSocket object created. Initial State:", websocket.readyState);
+        
+                            // Attach handlers
+                            websocket.onopen = (event) => {
+                                console.log('WebSocket connection opened:', event);
+                                updateVoiceStatus("Ready");
+                                setVoiceButtonState("Start Voice Chat", false); // Enable button
+        
+                                // *** Logic to start recording if button clicked while connecting ***
+                                console.log("WebSocket connection opened. shouldStartRecordingAfterConnect:", shouldStartRecordingAfterConnect);
+                                if (shouldStartRecordingAfterConnect) {
+                                    shouldStartRecordingAfterConnect = false; // Reset the flag
+                                    console.log("Starting recording automatically after connection.");
+                                    startRecording(); // Attempt to start recording immediately
+                                }
+                            };
+        
+// Inside your <script> block in index.html
 
-                const messageDiv = document.createElement('div');
-                messageDiv.classList.add(sender === 'user' ? 'user-message-bubble' : 'bot-message-bubble');
-                messageDiv.textContent = message;
+// ... other WebSocket handlers (onopen, onerror, onclose) ...
 
-                const timestampSpan = document.createElement('span');
-                timestampSpan.classList.add('message-timestamp');
-                const now = new Date();
-                const timeString = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                timestampSpan.textContent = timeString;
+                            websocket.onmessage = async (event) => {
+                                // --- ADD GENERAL DEBUG PRINT FOR ANY MESSAGE ---
+                                console.log('DEBUG WS: === Received message from backend ===');
+                                console.log('DEBUG WS: event.data type:', typeof event.data);
+                                console.log('DEBUG WS: event.data instanceof Blob:', event.data instanceof Blob);
+                                // ---------------------------------------------
 
-                messageContainer.appendChild(messageDiv);
-                messageContainer.appendChild(timestampSpan);
-                chatContainer.appendChild(messageContainer);
-                chatContainer.scrollTop = chatContainer.scrollHeight;
-            }
+                                if (event.data instanceof Blob) {
+                                    console.log('DEBUG WS: Handling binary (audio) message.');
+                                    console.log('Received audio Blob from backend. Size:', event.data.size);
+                                    updateVoiceStatus("Speaking...");
+                                    try {
+                                        const audioData = await event.data.arrayBuffer();
+                                        console.log('DEBUG WS: Audio blob converted to ArrayBuffer. Size:', audioData.byteLength);
+                                        playAudio(audioData);
+                                    } catch (e) {
+                                        console.error("Error processing received audio blob:", e);
+                                        updateVoiceStatus("Error playing audio");
+                                        // Allow restarting voice chat if playback failed
+                                        setVoiceButtonState("Start Voice Chat", false);
+                                    }
+                                    console.log('DEBUG WS: Finished handling binary message.');
 
-            function loadInitialSuggestions() {
-                if (token) {
-                    fetch('/api/chat/suggestions/', { // Replace with your actual URL for suggestions
-                        headers: {
-                            'Authorization': `Bearer ${token}`
-                        }
-                    })
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data && data.suggestions) {
-                            data.suggestions.forEach(product => {
-                                const listItem = document.createElement('li');
-                                listItem.textContent = product.name; // Adjust based on your product data structure
-                                suggestionsList.appendChild(listItem);
+                                } else if (typeof event.data === 'string') {
+                                    // --- ADD RAW TEXT DEBUG PRINT ---
+                                    console.log('DEBUG WS: Handling text message.');
+                                    console.log('DEBUG WS: Received text message (raw):', event.data);
+                                    // --------------------------------
+
+                                    try {
+                                        const message = JSON.parse(event.data);
+                                        console.log('DEBUG WS: Text message successfully parsed as JSON.');
+                                        console.log('Received JSON message:', message);
+
+                                        if (message.type === 'status') {
+                                            // --- ADD STATUS DETAILS DEBUG PRINT ---
+                                            console.log(`DEBUG WS: Handling status message - message: "${message.message}", detail: "${message.detail}"`);
+                                            // --------------------------------------
+                                            updateVoiceStatus(message.detail || message.message); // Update the status text element
+
+                                            if (message.message === 'ready') {
+                                                console.log("DEBUG WS: Status 'ready' received. Setting button to Start Voice Chat.");
+                                                setVoiceButtonState("Start Voice Chat", false); // Handles 'ready' - re-enables button
+                                                isRecording = false; // Ensure state is correct
+                                                // Text inputs enabled by setVoiceButtonState (called inside setVoiceButtonState)
+
+                                            } else if (message.message === 'processing') {
+                                                console.log("DEBUG WS: Status 'processing' received. Setting button to Processing...");
+                                                setVoiceButtonState("Processing...", true);
+                                                isRecording = false; // Should not be recording while processing
+                                                // Text inputs disabled by setVoiceButtonState
+
+                                            } else if (message.message === 'speaking') {
+                                                console.log("DEBUG WS: Status 'speaking' received. Setting button to Speaking...");
+                                                setVoiceButtonState("Speaking...", true);
+                                                isRecording = false; // Should not be recording while speaking
+                                                // Text inputs disabled by setVoiceButtonState
+
+                                            }
+                                            // --- ADD No speech detected. Status Handler ---
+                                            // This handles the case where the backend finished processing but Google found no speech
+                                            else if (message.message === 'No speech detected.') { // <-- ADD THIS CASE
+                                                console.log("DEBUG WS: Status 'No speech detected.' received. Setting button to Start Voice Chat.");
+                                                setVoiceButtonState("Start Voice Chat", false); // <-- Re-enable button after no speech
+                                                isRecording = false; // Ensure state is correct
+                                                // Text inputs enabled by setVoiceButtonState
+                                            }
+                                            // ----------------------------------------------
+
+                                        } else if (message.type === 'error') {
+                                            console.error("DEBUG WS: Handling error message.");
+                                            console.error("Backend Error:", message.detail || message.message);
+                                            updateVoiceStatus(`Error: ${message.detail || message.message}`);
+                                            setVoiceButtonState("Start Voice Chat", false); // Allow retrying
+                                            isRecording = false;
+                                            // Ensure local recording stops on backend error (although button state change should trigger this if recording)
+                                            // It might be safer to explicitly call stopRecording() here if isRecording was true
+                                            if (isRecording) {
+                                                stopRecording();
+                                            }
+                                            userInput.disabled = false; // Ensure text inputs are re-enabled
+                                            sendButton.disabled = false;
+                                            console.log('DEBUG WS: Finished handling error message.');
+
+                                        } else if (message.type === 'transcript_interim') {
+                                            // Handle interim transcript - display it somewhere if desired
+                                            // console.log('Interim Transcript:', message.transcript);
+                                            console.log('DEBUG WS: Handling interim transcript message (ignored for now).');
+
+                                        } else if (message.type === 'chatbot_response_text') {
+                                            console.log('DEBUG WS: Handling chatbot text response message.');
+                                            // Display the final text response
+                                            displayMessage(message.response, 'bot');
+                                            // Note: Playback is handled by the audio blob message,
+                                            // and status updates by the 'status' message type.
+                                            console.log('DEBUG WS: Finished handling chatbot text response message.');
+
+                                        } else if (message.type === 'suggestions') { // Example handler for suggestions if backend sends them
+                                            console.log('DEBUG WS: Handling suggestions message.');
+                                            // Assuming message.suggestions is an array of suggestion objects
+                                            if (message.suggestions && Array.isArray(message.suggestions)) {
+                                                dynamicSuggestionsList.innerHTML = ''; // Clear previous suggestions
+                                                message.suggestions.forEach(product => {
+                                                    const productLi = document.createElement('li');
+                                                    productLi.classList.add('dynamic-suggestion-item');
+                                                    // Adjust textContent based on your suggestion object structure
+                                                    productLi.textContent = `${product.name || 'Unknown Product'} (${product.category || 'N/A'})`;
+                                                    dynamicSuggestionsList.appendChild(productLi);
+                                                });
+                                                console.log(`DEBUG WS: Displayed ${message.suggestions.length} dynamic suggestions.`);
+                                            } else {
+                                                console.warn("DEBUG WS: Suggestions message received but format unexpected.", message);
+                                            }
+                                            console.log('DEBUG WS: Finished handling suggestions message.');
+
+                                        }
+                                        // Add other message types as needed
+
+                                    } catch (e) {
+                                        console.error('Error parsing WebSocket JSON message:', e, 'Message:', event.data);
+                                        updateVoiceStatus("Error processing message");
+                                        // Reset state on message processing error
+                                        setVoiceButtonState("Start Voice Chat", false);
+                                        isRecording = false;
+                                        if (isRecording) { // Stop recording if it was active when message parsing failed
+                                            stopRecording(); // Ensure local recording stops
+                                        }
+                                        userInput.disabled = false;
+                                        sendButton.disabled = false;
+                                        console.log('DEBUG WS: Finished handling error parsing JSON.');
+                                    }
+
+                                } else {
+                                    console.log('DEBUG WS: Received unexpected message type:', event.data);
+                                }
+                                console.log('DEBUG WS: === Finished handling message ===');
+                            };        
+                            websocket.onerror = (event) => {
+                                console.error('WebSocket error observed:', event);
+                                updateVoiceStatus("WebSocket Error");
+                                setVoiceButtonState("Start Voice Chat", false); // Allow retrying
+                                isRecording = false;
+                                stopRecording(); // Ensure local recording stops on WS error
+                                websocket = null; // Clear websocket reference
+                                userInput.disabled = false;
+                                sendButton.disabled = false;
+                            };
+        
+                            websocket.onclose = (event) => {
+                                console.log('WebSocket connection closed:', event);
+                                updateVoiceStatus(`Disconnected (Code: ${event.code}, Reason: ${event.reason || 'N/A'})`);
+                                setVoiceButtonState("Start Voice Chat", false); // Allow retrying
+                                isRecording = false;
+                                stopRecording(); // Ensure local recording stops on WS close
+                                websocket = null; // Clear websocket reference
+                                userInput.disabled = false;
+                                sendButton.disabled = false;
+                            };
+        
+                        } catch (error) {
+                            console.error("Error creating WebSocket object:", error);
+                            updateVoiceStatus("WS Init Error");
+                            setVoiceButtonState("Start Voice Chat", false); // Allow retrying
+                            isRecording = false;
+                        }
+                    }
+        
+        
+                    // --- Function to start recording and streaming audio to WebSocket ---
+async function startRecording() {
+                        console.log("--- Entering startRecording() ---"); // *** ADDED LOG ***
+                        if (isRecording) {
+                            console.log("Cannot start recording: already recording.");
+                            console.log("--- Exiting startRecording() (already recording) ---"); // *** ADDED LOG ***
+                            return;
+                        }
+                        // Ensure WebSocket is open before attempting to record
+                        if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+                            console.warn("Cannot start recording: WebSocket is not open. State:", websocket ? websocket.readyState : 'null');
+                            updateVoiceStatus("WS not open for recording");
+                            setVoiceButtonState("Start Voice Chat", false); // Allow retrying
+                            console.log("--- Exiting startRecording() (WS not open) ---"); // *** ADDED LOG ***
+                            return;
+                        }
+                        // Check for browser API support
+                        if (!navigator.mediaDevices || !window.AudioContext) {
+                            console.error("Browser does not support MediaDevices or AudioContext API required for voice.");
+                            updateVoiceStatus("Voice not supported in browser");
+                            setVoiceButtonState("Voice Unsupported", true); // Keep disabled
+                            console.log("--- Exiting startRecording() (Browser unsupported) ---"); // *** ADDED LOG ***
+                            return;
+                        }
+
+                        console.log("Attempting to get microphone access."); // *** ADDED LOG ***
+
+                        try {
+                            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                            console.log('Microphone access granted.'); // *** ADDED LOG ***
+                            mediaStream = stream;
+
+                            if (!audioContext) {
+                                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                                console.log('AudioContext created.'); // *** ADDED LOG ***
+                                console.log(`AudioContext sample rate: ${audioContext.sampleRate} Hz`);
+                                if (audioContext.sampleRate !== 16000) {
+                                    console.warn(`Backend STT expects 16000 Hz. Browser is using ${audioContext.sampleRate} Hz. Resampling might be needed for optimal accuracy.`);
+                                }
+                            } else if (audioContext.state === 'suspended') {
+                                // Resume AudioContext if it was suspended
+                                await audioContext.resume();
+                                console.log('AudioContext resumed.'); // *** ADDED LOG ***
+                            }
+
+
+                            audioSourceNode = audioContext.createMediaStreamSource(stream);
+                            console.log('MediaStreamSource created from microphone.'); // *** ADDED LOG ***
+
+                            const bufferSize = 4096;
+                            if (audioContext.createScriptProcessor) {
+                                scriptProcessorNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
+                                console.log(`ScriptProcessorNode created with buffer size ${bufferSize}.`); // *** ADDED LOG ***
+                            } else {
+                                console.error("ScriptProcessorNode not supported. AudioWorklet implementation is required.");
+                                updateVoiceStatus("Browser unsupported");
+                                setVoiceButtonState("Voice Unsupported", true);
+                                stream.getTracks().forEach(track => track.stop());
+                                mediaStream = null;
+                                console.log("--- Exiting startRecording() (ScriptProcessorNode unsupported) ---"); // *** ADDED LOG ***
+                                return;
+                            }
+
+                            audioSourceNode.connect(scriptProcessorNode);
+                            scriptProcessorNode.connect(audioContext.destination); // Connect to destination to keep AudioContext alive
+
+scriptProcessorNode.onaudioprocess = (event) => {
+                            // Keep this uncommented initially to see events firing
+                            // console.log("onaudioprocess event fired.");
+    
+                            const inputBuffer = event.inputBuffer;
+                            const audioData = inputBuffer.getChannelData(0); // Float32Array
+    
+                            // === Basic VAD Implementation (Integrated Here) ===
+                            // Calculate RMS energy (volume) of the current audio chunk
+                            let sumOfSquares = 0;
+                            for (let i = 0; i < audioData.length; i++) {
+                                sumOfSquares += audioData[i] * audioData[i];
+                            }
+                            let rms = Math.sqrt(sumOfSquares / audioData.length);
+    
+                            // *** LOG FOR RMS - Keep this uncommented to see audio levels ***
+                            console.log(`VAD: RMS = ${rms.toFixed(4)}`);
+                            // ************************
+    
+    
+                            const currentTime = Date.now();
+    
+                            if (rms > vadThreshold) {
+                                // Speech detected (or noise above threshold)
+                                vadLastSpeechTime = currentTime;
+                                // If a silence timer was running, speech has interrupted it, so clear it.
+                                if (vadSilenceTimer) {
+                                    // console.log('VAD: Speech detected, clearing silence timer.');
+                                    clearTimeout(vadSilenceTimer);
+                                    vadSilenceTimer = null;
+                                }
+                            } else {
+                                // Silence detected (or noise below threshold)
+                                const silenceDuration = currentTime - vadLastSpeechTime;
+    
+                                // If silence is longer than the threshold AND we are currently recording,
+                                // AND a silence timer is NOT already active, start a new timer.
+                                if (isRecording && vadSilenceTimer === null && silenceDuration >= vadSilenceDurationThreshold) {
+                                    // The condition `silenceDuration >= vadSilenceDurationThreshold` should probably be
+                                    // checked *after* starting the timer if you want the timer to run for the FULL duration
+                                    // of the threshold after speech stops. Let's adjust the logic slightly:
+                                    // Start a timer *as soon as silence is detected* if we're recording and no timer is active.
+                                    // The timer's *duration* should be the threshold.
+                                    console.log(`VAD: Detected silence (RMS=${rms.toFixed(4)}). Starting potential stop timer (duration: ${vadSilenceDurationThreshold}ms).`);
+                                    vadSilenceTimer = setTimeout(() => {
+                                        console.log('VAD: Silence timer finished. Stopping recording automatically.');
+                                        stopRecording(); // Automatically stop recording and send signal
+                                        vadSilenceTimer = null; // Reset timer ID
+                                    }, vadSilenceDurationThreshold); // Timer runs for the specified silence duration threshold
+                                } else if (isRecording && vadSilenceTimer !== null) {
+                                    // If silence continues and a timer is already running, do nothing (let the timer finish)
+                                    // console.log(`VAD: Silence continues. Timer is active. RMS=${rms.toFixed(4)}`);
+                                }
+                                // If not recording, do nothing.
+                            }
+                            // ==============================
+    
+    
+                            // Convert Float32Array to Int16Array
+                            const int16Array = convertFloat32ToInt16(audioData);
+    
+                            // *** Keep these logs if helpful, but they fire very frequently ***
+                            // console.log("WebSocket state inside onaudioprocess:", websocket ? websocket.readyState : 'null');
+                            // console.log("Audio data chunk size (bytes):", int16Array.buffer.byteLength);
+                            // console.log("Sample rate from AudioContext:", audioContext.sampleRate);
+                            // ************************
+    
+    
+                            // Only send audio data if currently recording (VAD hasn't stopped it yet)
+                            // and WebSocket is open.
+                            if (isRecording && websocket && websocket.readyState === WebSocket.OPEN) {
+                                console.log(`Sending ${int16Array.byteLength} bytes of audio via WS.`);
+                                websocket.send(int16Array.buffer); // Send the ArrayBuffer
+                            } else if (!isRecording) {
+                                 // If recording has just stopped (by VAD or button),
+                                 // we might get one last chunk here, but we shouldn't send it.
+                                 // The stop_recording signal will be sent by stopRecording().
+                                 // console.log("Recording stopped, skipping sending audio chunk.");
+                             } else {
+                                console.warn("WebSocket not open while recording, cannot send audio chunk. State:", websocket ? websocket.readyState : 'null');
+                                // Consider adding logic here to stop recording if the WS is unexpectedly closed during recording
+                                // stopRecording(); // Might be too aggressive
+                            }
+                        };
+                            // ... rest of convertFloat32ToInt16 and the end of startRecording ...        
+                            function convertFloat32ToInt16(buffer) {
+                                let l = buffer.length;
+                                const buf = new Int16Array(l);
+                                while (l--) {
+                                    buf[l] = Math.max(-1, Math.min(1, buffer[l])) * 0x7FFF;
+                                }
+                                return buf;
+                            }
+        
+                            isRecording = true;
+                            updateVoiceStatus("Listening...");
+                            setVoiceButtonState("Stop Voice Chat", false);
+                            console.log("--- startRecording() successful. Listening... ---"); // *** ADDED LOG ***
+        
+                        } catch (error) {
+                            console.error('Error starting recording or accessing microphone:', error);
+                            updateVoiceStatus(`Error: ${error.message}`);
+                            setVoiceButtonState("Start Voice Chat", false); // Allow retrying
+                            isRecording = false;
+                            // Clean up stream if it was obtained before the error
+                            if (mediaStream) {
+                                mediaStream.getTracks().forEach(track => track.stop());
+                                mediaStream = null;
+                            }
+                            // Disconnect nodes if they were created
+                            if (audioSourceNode) {
+                                audioSourceNode.disconnect();
+                                audioSourceNode = null;
+                            }
+                            if (scriptProcessorNode) {
+                                scriptProcessorNode.disconnect();
+                                scriptProcessorNode.onaudioprocess = null;
+                                scriptProcessorNode = null;
+                            }
+        
+                            console.log("--- startRecording() failed. ---"); // *** ADDED LOG ***
+                        }
+                    }
+        
+                    // --- Function to stop recording and streaming ---
+                    function stopRecording() {
+                        console.log("--- Entering stopRecording() ---"); // *** ADDED LOG ***
+                        if (!isRecording) {
+                            console.log("Not currently recording, cannot stop.");
+                            console.log("--- Exiting stopRecording() (not recording) ---"); // *** ADDED LOG ***
+                            return;
+                        }
+                        console.log("Stopping recording."); // *** ADDED LOG ***
+        
+                        // Stop microphone tracks
+                        if (mediaStream && mediaStream.getTracks) {
+                            mediaStream.getTracks().forEach(track => track.stop());
+                            console.log('Microphone tracks stopped.'); // *** ADDED LOG ***
+                        }
+                        mediaStream = null;
+        
+                        // Disconnect Web Audio API nodes
+                        if (audioSourceNode) {
+                            audioSourceNode.disconnect();
+                            audioSourceNode = null;
+                        }
+                        if (scriptProcessorNode) {
+                            scriptProcessorNode.disconnect();
+                            scriptProcessorNode.onaudioprocess = null; // Remove event listener
+                            scriptProcessorNode = null;
+                        }
+        
+                        // Pause AudioContext when not in use to save resources
+                        if (audioContext && audioContext.state === 'running') {
+                            audioContext.suspend().then(() => {
+                                console.log('AudioContext suspended.'); // *** ADDED LOG ***
                             });
                         }
-                    })
-                    .catch(error => console.error('Error loading suggestions:', error));
-                }
-            }
-
-            loadInitialSuggestions();
-
-            sendButton.addEventListener('click', () => {
-                const message = userInput.value.trim();
-                if (message && token) {
-                    displayMessage(message, 'user');
-                    userInput.value = '';
-
-                    fetch('/api/chat/send/', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'Authorization': `Bearer ${token}`
-                        },
-                        body: JSON.stringify({ message: message })
-                    })
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data && data.response) {
-                            displayMessage(data.response, 'bot');
-                        } else if (data && data.error) {
-                            displayMessage(`Error: ${data.error}`, 'bot');
+        
+        
+                        // Send stop signal to backend
+                        if (websocket && websocket.readyState === WebSocket.OPEN) {
+                            console.log("Sending stop_recording signal to backend."); // *** ADDED LOG ***
+                            websocket.send(JSON.stringify({ type: 'stop_recording' }));
+                        } else {
+                            console.warn("WebSocket not open, cannot send stop_recording signal. State:", websocket ? websocket.readyState : 'null');
+                            updateVoiceStatus("Disconnected"); // Or an appropriate status
+                            setVoiceButtonState("Start Voice Chat", false); // Allow retrying
+                        }
+        
+                        isRecording = false;
+                        // Status will be updated by backend WebSocket messages (e.g., 'processing', 'ready')
+                        console.log("--- Exiting stopRecording() ---"); // *** ADDED LOG ***
+                    }
+        
+                    // --- Function to decode and play received audio data ---
+                    async function playAudio(audioData) {
+                        console.log("--- Entering playAudio() ---"); // *** ADDED LOG ***
+                        if (!audioContext) {
+                            console.error("AudioContext not available for playback.");
+                            updateVoiceStatus("Error: Playback failed (No AudioContext)");
+                            setVoiceButtonState("Start Voice Chat", false);
+                            console.log("--- Exiting playAudio() (No AudioContext) ---"); // *** ADDED LOG ***
+                            return;
+                        }
+                        if (!(audioData instanceof ArrayBuffer)) {
+                            console.error("Invalid audio data format received for playback.");
+                            updateVoiceStatus("Error: Playback failed (Format)");
+                            setVoiceButtonState("Start Voice Chat", false);
+                            console.log("--- Exiting playAudio() (Invalid format) ---"); // *** ADDED LOG ***
+                            return;
+                        }
+        
+                        // Ensure AudioContext is running before decoding/playing
+                        if (audioContext.state === 'suspended') {
+                            await audioContext.resume();
+                            console.log('AudioContext resumed for playback.'); // *** ADDED LOG ***
                         }
-
-                        dynamicSuggestionsList.innerHTML = '';
-                        if (data && data.suggested_products) {
-                            data.suggested_products.forEach(product => {
-                                const productLi = document.createElement('li');
-                                productLi.classList.add('dynamic-suggestion-item');
-                                productLi.textContent = `${product.name} (${product.category})`;
-                                dynamicSuggestionsList.appendChild(productLi);
-                            });
-                        }
-                    })
-                    .catch(error => {
-                        console.error('Error sending message:', error);
-                        displayMessage('Error sending message. Please try again.', 'bot');
-                    });
-                } else if (!token) {
-                    alert("You are not logged in.");
-                    window.location.href = '/api/users/'; // Redirect to login page
-                }
-            });
-
-            // Optional: Allow sending message with Enter key
-            userInput.addEventListener('keypress', (event) => {
-                if (event.key === 'Enter') {
-                    sendButton.click();
-                }
-            });
-        });
-    </script>
+        
+                        console.log(`Attempting to play ${audioData.byteLength} bytes of audio.`); // *** ADDED LOG ***
+        
+                        try {
+                            const audioBuffer = await audioContext.decodeAudioData(audioData);
+                            console.log("Audio data decoded successfully."); // *** ADDED LOG ***
+        
+                            const source = audioContext.createBufferSource();
+                            source.buffer = audioBuffer;
+        
+                            source.connect(audioContext.destination);
+                            console.log("AudioBufferSourceNode connected to destination."); // *** ADDED LOG ***
+        
+        
+                            source.start(0);
+        
+                            console.log("Audio playback started."); // *** ADDED LOG ***
+        
+                            source.onended = () => {
+                                console.log("Audio playback finished."); // *** ADDED LOG ***
+                                // Status should be set to 'ready' by the backend after speaking
+                                // setVoiceButtonState("Start Voice Chat", false); // Redundant if backend sends status
+                                // Clean up source node after playback ends
+                                source.disconnect();
+                                console.log("AudioBufferSourceNode disconnected after playback."); // *** ADDED LOG ***
+                            };
+        
+                        } catch (error) {
+                            console.error('Error decoding or playing audio:', error);
+                            updateVoiceStatus(`Error: Playback failed (${error.message})`);
+                            setVoiceButtonState("Start Voice Chat", false); // Allow retrying
+                            console.log("--- playAudio() failed. ---"); // *** ADDED LOG ***
+                        }
+                        console.log("--- Exiting playAudio() ---"); // *** ADDED LOG ***
+                    }
+        
+        
+                    // --- Event Listener for Voice Toggle Button ---
+                    voiceToggleBtn.addEventListener('click', () => {
+                        console.log("Voice Toggle Button clicked."); // *** ADDED LOG ***
+                        const tokenCheck = localStorage.getItem('access_token');
+                        if (!tokenCheck) {
+                            console.error("No token found. Cannot perform voice action.");
+                            updateVoiceStatus("Login Required");
+                            setVoiceButtonState("Login Required", true);
+                            alert("Please log in to use voice chat.");
+                            return;
+                        }
+        
+                        // Corrected logic: Check if WebSocket is NOT open or doesn't exist
+                        if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+                            console.log(`WebSocket state is ${websocket ? websocket.readyState : 'null'}. Attempting connection.`); // *** ADDED LOG ***
+                            setVoiceButtonState("Connecting...", true); // Set status while connecting
+                            shouldStartRecordingAfterConnect = true; // Set flag to indicate recording should start after WS opens
+                            connectWebSocket();
+                        } else if (websocket.readyState === WebSocket.OPEN) {
+                            console.log("WebSocket is open, toggling recording state."); // *** ADDED LOG ***
+                            if (isRecording) {
+                                stopRecording();
+                            } else {
+                                // Check if AudioContext needs to be resumed before starting recording
+                                if (audioContext && audioContext.state === 'suspended') {
+                                    audioContext.resume().then(() => {
+                                        console.log('AudioContext resumed by click before starting recording.'); // *** ADDED LOG ***
+                                        startRecording(); // Now safe to start recording
+                                    }).catch(e => {
+                                        console.error('Error resuming AudioContext before recording:', e); // *** ADDED LOG ***
+                                        updateVoiceStatus("Error resuming audio");
+                                        setVoiceButtonState("Start Voice Chat", false);
+                                    });
+                                } else {
+                                    startRecording(); // AudioContext is running or doesn't exist yet (will be created in startRecording)
+                                }
+                            }
+                        } else if (websocket.readyState === WebSocket.CONNECTING) {
+                            console.log("WebSocket is connecting, please wait... Setting flag to start recording after connect."); // *** ADDED LOG ***
+                            shouldStartRecordingAfterConnect = true; // Set flag so recording starts when connection opens
+                        } else {
+                            console.warn("Voice Toggle Button clicked in unexpected WebSocket state:", websocket.readyState); // *** ADDED LOG ***
+                            updateVoiceStatus(`WS State: ${websocket.readyState}`);
+                            setVoiceButtonState("Start Voice Chat", false); // Allow retrying
+                        }
+                    });
+        
+        
+                }); // End DOMContentLoaded
+            </script>
 </body>
 </html>
