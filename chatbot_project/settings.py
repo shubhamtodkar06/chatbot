@@ -112,8 +112,20 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
+# In your settings.py
+# settings.py
 
-# Internationalization
+# ... (other settings) ...
+
+# Static files (CSS, JavaScript, Images)
+# https://docs.djangoproject.com/en/5.1/howto/static-files/
+
+STATIC_URL = '/static/'
+# STATICFILES_DIRS = [BASE_DIR / 'chat' / 'static'] # Keep this commented or removed
+
+STATIC_ROOT = BASE_DIR / 'staticfiles' # <-- Add this line if it's not there
+
+# ... (rest of settings) ...# Internationalization
 # https://docs.djangoproject.com/en/5.1/topics/i18n/
 
 LANGUAGE_CODE = 'en-us'
@@ -128,7 +140,10 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.1/howto/static-files/
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
+#STATICFILES_DIRS = [BASE_DIR / 'chat' / 'static']
+
+
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
