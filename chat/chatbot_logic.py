@@ -295,5 +295,3 @@ async def process_voice_transcript(user, user_message, thread_id):
         print(f"chatbot_logic: Error processing voice transcript with Assistant: {e}") # Add log
         # Re-raise the exception so the caller (consumer) can handle it
         raise
-
-
