@@ -99,9 +99,29 @@ async def load_or_create_openai_thread_async(user):
 
     return thread_id # Return the thread_id
 
+def retrieve_relevant_info(self, query, retriever, llm):
+        prompt_template = """Use the following pieces of context to answer the user's question. If you don't know the answer, just say that you don't know, don't try to make up an answer.
+
+        Context:
+        {context}
+
+        Question: {question}"""
+        PROMPT = PromptTemplate(
+            template=prompt_template, input_variables=["context", "question"]
+        )
+
+        qa = RetrievalQA.from_chain_type(
+            llm=apps.get_app_config('chat').llm,
+            chain_type="stuff",
+            retriever=apps.get_app_config('chat').retriever,
+            return_source_documents=False,
+            chain_type_kwargs={"prompt": PROMPT}
+        )
+        result = qa({"query": query})
+        return result['result']
 
 # This async function replaces the core logic inside SendMessageView.post
-async def process_voice_transcript(user, user_message, thread_id):
+async def process_voice_transcript1(user, user_message, thread_id):
     """
     Processes a user's voice transcript using the OpenAI Assistant.
     Adds message to thread, runs the assistant, retrieves response,
@@ -272,26 +292,140 @@ async def process_voice_transcript(user, user_message, thread_id):
                     chatbot_response = "Received non-text response from assistant."
                     print(f"chatbot_logic: Assistant response is not text: {latest_message.content}") # Add log
 
-        # Optional: Save assistant response to DB if desired (sync DB call in thread pool)
-        # It might be better to save the full_response before parsing if you want to
-        # preserve the raw assistant output in the chat history.
-        # await loop.run_in_executor(
-        #      None,
-        #      lambda: ChatHistory.objects.create(
-        #           user=user,
-        #           role="assistant",
-        #           content=full_response if 'full_response' in locals() else chatbot_response, # Save raw or parsed
-        #           thread_id=thread_id # Link to the same thread
-        #      )
-        # )
-        # print("chatbot_logic: Assistant response saved to database.") # Add log
-
-
-        # Return the text response and suggestions
         print("chatbot_logic: Returning response and suggestions.") # Add log
         return {"response": chatbot_response, "suggested_products": suggested_products}
 
     except Exception as e:
         print(f"chatbot_logic: Error processing voice transcript with Assistant: {e}") # Add log
         # Re-raise the exception so the caller (consumer) can handle it
+        raise
+
+
+import os
+import asyncio
+from django.apps import apps  # <-- ADD THIS LINE
+from openai import OpenAI
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from chat.models import ChatHistory, Product  # Replace `yourapp` with actual app name
+ 
+async def process_voice_transcript(user, user_message, thread_id):
+    """
+    Processes a user's voice transcript using a custom prompt-based LLM approach.
+    Retrieves relevant info, formats a prompt, calls OpenAI chat completion,
+    and extracts structured response and product suggestions.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        llm = apps.get_app_config('chat').llm
+        retriever = apps.get_app_config('chat').retriever
+
+        # --- Retrieve relevant information using retriever ---
+        def get_retrieved_info():
+            prompt_template = """Use the following pieces of context to answer the user's question. If you don't know the answer, just say that you don't know, don't try to make up an answer.
+
+Context:
+{context}
+
+Question: {question}"""
+            PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+            qa = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=retriever,
+                return_source_documents=False,
+                chain_type_kwargs={"prompt": PROMPT}
+            )
+            return qa({"query": user_message})["result"]
+
+        retrieved_info = await loop.run_in_executor(None, get_retrieved_info)
+
+        # --- Get conversation history and product list ---
+        conversation_history = await loop.run_in_executor(
+            None,
+            lambda: list(ChatHistory.objects.filter(user=user).order_by('timestamp').values_list('role', 'content'))
+        )
+        formatted_history = "\n".join([f"{role.capitalize()}: {content}" for role, content in conversation_history])
+
+        available_products = await loop.run_in_executor(
+            None,
+            lambda: list(Product.objects.values_list('name', flat=True))
+        )
+        products_formatted = "\n".join([f"- {p}" for p in available_products])
+
+        prompt_content = f"""You are a helpful AI assistant for suggesting products from the following list: {', '.join(available_products)}.
+
+You will be provided with relevant product information and the user's current message, along with the entire conversation history for context. Your goal is to respond to the user's query and suggest up to 3 relevant products.
+
+Format your response with "**Response:**" followed by your conversational answer, and then "**Suggested Products:**" followed by a bulleted list of product names. If no products are relevant, you can omit the "Suggested Products" section.
+
+Relevant Product Information:
+{retrieved_info}
+
+Conversation History:
+{formatted_history}
+
+Current Message:
+User: {user_message}
+
+**Response:** """
+
+        # --- Call OpenAI completion endpoint ---
+        response = await loop.run_in_executor(
+            None,
+            lambda: client.chat.completions.create(
+                model="gpt-4-turbo",
+                messages=[{"role": "user", "content": prompt_content}],
+                max_tokens=500,
+                n=1,
+                temperature=0.7,
+            )
+        )
+        full_response = response.choices[0].message.content.strip()
+        print(f"chatbot_logic: Full Chatbot Response: {full_response}")
+
+        # --- Parse response and extract suggestions ---
+        chatbot_response = full_response
+        suggestions_text = ""
+        suggested_products = []
+
+        if "**Suggested Products:**" in full_response:
+            parts = full_response.split("**Suggested Products:**")
+            chatbot_response = parts[0].replace("**Response:**", "").strip()
+            suggestions_text = parts[1].strip() if len(parts) > 1 else ""
+
+            suggestion_lines = [line.strip().lstrip('- ').strip() for line in suggestions_text.split('\n') if line.strip().startswith('-')]
+
+            for name in suggestion_lines:
+                if name.lower() in [p.lower() for p in available_products]:
+                    product_obj = await loop.run_in_executor(
+                        None,
+                        lambda: Product.objects.filter(name__iexact=name).first()
+                    )
+                    if product_obj:
+                        suggested_products.append({
+                            "name": product_obj.name,
+                            "category": product_obj.category
+                        })
+                    if len(suggested_products) >= 3:
+                        break
+
+        # --- Save messages to DB ---
+        await loop.run_in_executor(
+            None,
+            lambda: ChatHistory.objects.create(user=user, role="user", content=user_message, thread_id=thread_id)
+        )
+        await loop.run_in_executor(
+            None,
+            lambda: ChatHistory.objects.create(user=user, role="assistant", content=chatbot_response, thread_id=thread_id)
+        )
+
+        print(f"chatbot_logic: Final Response: {chatbot_response}")
+        print(f"chatbot_logic: Suggested Products: {suggested_products}")
+
+        return {"response": chatbot_response, "suggested_products": suggested_products}
+
+    except Exception as e:
+        print(f"chatbot_logic: Error processing voice transcript: {e}")
         raise

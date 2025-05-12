@@ -273,7 +273,7 @@ class SendMessageView1(APIView):
     
     
 #------implementation without langChain using OpenAi Assistant API
-class SendMessageView(APIView):
+class SendMessageView2(APIView):
     authentication_classes = [JWTAuthentication]
     permission_classes = [IsAuthenticated]
 
@@ -391,7 +391,7 @@ Past Conversation History:\n\nAvailable Products:\n{products_formatted}"""
 
 
 # --------using completion api model ---
-class SendMessageView2(APIView):
+class SendMessageView(APIView):
     def retrieve_relevant_info(self, query, retriever, llm):
         prompt_template = """Use the following pieces of context to answer the user's question. If you don't know the answer, just say that you don't know, don't try to make up an answer.
 
